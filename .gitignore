@@ -1,0 +1,6 @@
+/data/
+*.csv
+.claude
+.vscode
+/report/
+.DS_Store
