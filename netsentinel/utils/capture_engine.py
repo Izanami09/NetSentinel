@@ -305,7 +305,11 @@ class PacketParser:
                 udp = packet[UDP]
                 info["src_port"] = udp.sport
                 info["dst_port"] = udp.dport
-                info["protocol"] = "UDP"
+                # QUIC runs over UDP/443 — tag it so quic_ratio matches training
+                if udp.sport == 443 or udp.dport == 443:
+                    info["protocol"] = "QUIC"
+                else:
+                    info["protocol"] = "UDP"
                 service = self._get_service(udp.sport, udp.dport)
                 info["service"] = service
                 layers.append({
@@ -1085,12 +1089,12 @@ class ARPSpoofer:
 class CaptureEngine:
     """Manages live packet capture in a background thread."""
 
-    def __init__(self, interface: str = None, max_packets: int = 10000):
+    def __init__(self, interface: str = None, max_packets: int = 0):
         self.parser = PacketParser()
         self.flow_agg = FlowAggregator()
-        self.packet_queue = queue.Queue(maxsize=max_packets)
+        self.packet_queue = queue.Queue(maxsize=100000)
         self.packets = []
-        self.max_packets = max_packets
+        self.max_packets = max_packets  # 0 = unlimited
         self.is_running = False
         self.interface = interface
         self.capture_thread = None
@@ -1109,7 +1113,7 @@ class CaptureEngine:
             if parsed.get("threat_level") in ("medium", "high"):
                 self.stats["threats_detected"] += 1
             self.packets.append(parsed)
-            if len(self.packets) > self.max_packets:
+            if self.max_packets > 0 and len(self.packets) > self.max_packets:
                 self.packets = self.packets[-self.max_packets:]
             try:
                 self.packet_queue.put_nowait(parsed)

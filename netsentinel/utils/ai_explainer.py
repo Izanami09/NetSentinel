@@ -421,4 +421,236 @@ class ReportGenerator:
 
         pdf.output(output_path)
         return output_path
-    
+
+# ─────────────────────────────────────────────
+# App Fingerprinting Engine
+# ─────────────────────────────────────────────
+class AppFingerprinter:
+    """Identifies apps from traffic patterns using trained XGBoost and 1D-CNN models."""
+
+    def __init__(self):
+        self.xgb_model = None
+        self.cnn_model = None
+        self.scaler = None
+        self.label_encoder = None
+        self.stat_features = None
+        self.pss_max = None
+        self._load_models()
+
+    def _load_models(self):
+        try:
+            xgb_path = os.path.join(MODEL_DIR, "app_xgboost.pkl")
+            if os.path.exists(xgb_path):
+                self.xgb_model = joblib.load(xgb_path)
+                self.scaler = joblib.load(os.path.join(MODEL_DIR, "app_scaler.pkl"))
+                self.label_encoder = joblib.load(os.path.join(MODEL_DIR, "app_label_encoder.pkl"))
+                self.stat_features = joblib.load(os.path.join(MODEL_DIR, "app_stat_features.pkl"))
+                self.pss_max = joblib.load(os.path.join(MODEL_DIR, "app_pss_max.pkl"))
+                print("  ✅ App XGBoost model loaded")
+
+            cnn_path = os.path.join(MODEL_DIR, "app_cnn_model.keras")
+            if os.path.exists(cnn_path):
+                # Force CPU-only to avoid Metal/GPU segfault on Apple Silicon
+                os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+                os.environ["TF_METAL_DEVICE_ENABLE"] = "0"
+                import tensorflow as tf
+                tf.config.set_visible_devices([], "GPU")
+                self.cnn_model = tf.keras.models.load_model(cnn_path)
+                print("  ✅ App 1D-CNN model loaded (CPU mode)")
+        except Exception as e:
+            print(f"  ⚠️ App fingerprinting models not loaded: {e}")
+
+    def predict(self, window_packets: list) -> dict:
+        """Predict which app generated this traffic window.
+        
+        Args:
+            window_packets: list of packet dicts from a time window
+            
+        Returns:
+            dict with predictions from both models
+        """
+        if not self.xgb_model or len(window_packets) < 3:
+            return None
+
+        try:
+            sizes = [p.get("size", 0) for p in window_packets]
+            directions = [p.get("direction", 1) if "direction" in p else
+                         (1 if p.get("src_ip", "").startswith("192.168.") or 
+                          p.get("src_ip", "").startswith("10.") else -1)
+                         for p in window_packets]
+            signed_sizes = [s * d for s, d in zip(sizes, directions)]
+            timestamps = [p.get("epoch", 0) for p in window_packets]
+            payload_sizes = [p.get("payload_size", 0) for p in window_packets]
+
+            # IATs
+            iats = [timestamps[i] - timestamps[i-1] for i in range(1, len(timestamps)) if timestamps[i] > timestamps[i-1]]
+
+            up_sizes = [s for s, d in zip(sizes, directions) if d == 1]
+            down_sizes = [s for s, d in zip(sizes, directions) if d == -1]
+
+            up_iats, down_iats = [], []
+            last_up, last_down = None, None
+            for ts, d in zip(timestamps, directions):
+                if d == 1:
+                    if last_up: up_iats.append(ts - last_up)
+                    last_up = ts
+                else:
+                    if last_down: down_iats.append(ts - last_down)
+                    last_down = ts
+
+            duration = max(timestamps[-1] - timestamps[0], 0.001) if len(timestamps) > 1 else 0.001
+
+            # Bursts
+            bursts = []
+            cb = 1
+            for iat in iats:
+                if iat < 0.05: cb += 1
+                else:
+                    if cb > 1: bursts.append(cb)
+                    cb = 1
+            if cb > 1: bursts.append(cb)
+
+            dst_ports = set(p.get("dst_port", 0) for p in window_packets if "dst_port" in p)
+
+            sb = [0]*5
+            for s in sizes:
+                if s < 100: sb[0] += 1
+                elif s < 300: sb[1] += 1
+                elif s < 600: sb[2] += 1
+                elif s < 1000: sb[3] += 1
+                else: sb[4] += 1
+            tp = max(len(sizes), 1)
+            sb = [b/tp for b in sb]
+
+            n_tcp  = sum(1 for p in window_packets if p.get("protocol") == "TCP")
+            # QUIC is already tagged in capture_engine; also catch UDP/443 as fallback
+            n_quic = sum(1 for p in window_packets if p.get("protocol") == "QUIC" or
+                        (p.get("protocol") == "UDP" and
+                         (p.get("dst_port") == 443 or p.get("src_port") == 443)))
+            # Pure UDP = UDP that is not QUIC
+            n_udp  = sum(1 for p in window_packets if p.get("protocol") == "UDP" and
+                        p.get("dst_port") != 443 and p.get("src_port") != 443)
+            n_total = max(len(window_packets), 1)
+
+            raw_features = {
+                "window_duration": duration,
+                "total_packets": len(window_packets),
+                "total_bytes": sum(sizes),
+                "packets_per_sec": len(window_packets) / duration,
+                "bytes_per_sec": sum(sizes) / duration,
+                "pkt_size_mean": np.mean(sizes),
+                "pkt_size_std": np.std(sizes),
+                "pkt_size_min": np.min(sizes),
+                "pkt_size_max": np.max(sizes),
+                "pkt_size_median": np.median(sizes),
+                "pkt_size_q25": np.percentile(sizes, 25),
+                "pkt_size_q75": np.percentile(sizes, 75),
+                "pkt_size_skew": float(pd.Series(sizes).skew()) if len(sizes) > 2 else 0,
+                "pkt_size_iqr": np.percentile(sizes, 75) - np.percentile(sizes, 25),
+                "size_bin_tiny": sb[0], "size_bin_small": sb[1], "size_bin_medium": sb[2],
+                "size_bin_large": sb[3], "size_bin_jumbo": sb[4],
+                "payload_mean": np.mean(payload_sizes),
+                "payload_std": np.std(payload_sizes),
+                "payload_max": np.max(payload_sizes),
+                "payload_zero_ratio": sum(1 for p in payload_sizes if p == 0) / len(payload_sizes),
+                "payload_total": sum(payload_sizes),
+                "iat_mean": np.mean(iats) if iats else 0,
+                "iat_std": np.std(iats) if iats else 0,
+                "iat_min": np.min(iats) if iats else 0,
+                "iat_max": np.max(iats) if iats else 0,
+                "iat_median": np.median(iats) if iats else 0,
+                "iat_q25": np.percentile(iats, 25) if iats else 0,
+                "iat_q75": np.percentile(iats, 75) if iats else 0,
+                "upload_packets": len(up_sizes),
+                "download_packets": len(down_sizes),
+                "upload_ratio": len(up_sizes) / n_total,
+                "download_ratio": len(down_sizes) / n_total,
+                "up_down_ratio": len(up_sizes) / max(len(down_sizes), 1),
+                "up_bytes_total": sum(up_sizes) if up_sizes else 0,
+                "up_size_mean": np.mean(up_sizes) if up_sizes else 0,
+                "up_size_std": np.std(up_sizes) if up_sizes else 0,
+                "up_size_max": np.max(up_sizes) if up_sizes else 0,
+                "down_bytes_total": sum(down_sizes) if down_sizes else 0,
+                "down_size_mean": np.mean(down_sizes) if down_sizes else 0,
+                "down_size_std": np.std(down_sizes) if down_sizes else 0,
+                "down_size_max": np.max(down_sizes) if down_sizes else 0,
+                "up_iat_mean": np.mean(up_iats) if up_iats else 0,
+                "up_iat_std": np.std(up_iats) if up_iats else 0,
+                "down_iat_mean": np.mean(down_iats) if down_iats else 0,
+                "down_iat_std": np.std(down_iats) if down_iats else 0,
+                "n_bursts": len(bursts),
+                "avg_burst_size": np.mean(bursts) if bursts else 0,
+                "max_burst_size": max(bursts) if bursts else 0,
+                "burst_ratio": sum(bursts) / n_total if bursts else 0,
+                "n_unique_dst_ports": len(dst_ports),
+                "tcp_ratio": n_tcp / n_total,
+                "udp_ratio": n_udp / n_total,
+                "quic_ratio": n_quic / n_total,
+            }
+
+            # Build feature vector for XGBoost
+            feat_vector = [raw_features.get(f, 0) for f in self.stat_features]
+            X_stat = pd.DataFrame([feat_vector], columns=self.stat_features)
+            X_stat_scaled = pd.DataFrame(self.scaler.transform(X_stat), columns=self.stat_features)
+
+            # XGBoost prediction
+            xgb_proba = self.xgb_model.predict_proba(X_stat_scaled)[0]
+            xgb_pred_idx = np.argmax(xgb_proba)
+            xgb_app = self.label_encoder.classes_[xgb_pred_idx]
+            xgb_conf = float(xgb_proba[xgb_pred_idx])
+
+            result = {
+                "xgb_app": xgb_app,
+                "xgb_confidence": xgb_conf,
+                "xgb_all_probs": {self.label_encoder.classes_[i]: float(p) for i, p in enumerate(xgb_proba)},
+            }
+
+            # ── Idle/low-traffic gate ────────────────────────────────────
+            # Background OS traffic (updates, sync) looks like YouTube because
+            # it's also QUIC to Google IPs — gate on throughput to avoid false calls
+            bytes_per_sec = raw_features["bytes_per_sec"]
+            is_idle = bytes_per_sec < 30_000  # < 30 KB/s = background noise
+
+            # ── Confidence gate ──────────────────────────────────────────
+            MIN_CONFIDENCE = 0.52  # raised from 0.40 — fewer wrong guesses
+            if xgb_conf < MIN_CONFIDENCE or is_idle:
+                result["xgb_app"] = "Unknown"
+
+            # CNN prediction
+            if self.cnn_model and self.pss_max:
+                # Read PSS length from model input shape — matches training exactly
+                cnn_seq_len = self.cnn_model.input_shape[1]
+                pss = signed_sizes[:cnn_seq_len]
+                pss = pss + [0] * (cnn_seq_len - len(pss))
+                pss_norm = np.array(pss) / self.pss_max
+                X_cnn = pss_norm.reshape(1, cnn_seq_len, 1)
+
+                import tensorflow as tf
+                with tf.device("/CPU:0"):
+                    cnn_proba = self.cnn_model.predict(X_cnn, verbose=0)[0]
+                cnn_pred_idx = np.argmax(cnn_proba)
+                cnn_app = self.label_encoder.classes_[cnn_pred_idx]
+                cnn_conf = float(cnn_proba[cnn_pred_idx])
+
+                # CNN trained poorly (val_acc ~17%) — heavily downweight it.
+                # Keep it visible in the table for debugging but don't let it
+                # pull the ensemble away from XGBoost's verdict.
+                if cnn_conf < MIN_CONFIDENCE or is_idle:
+                    cnn_app = "Unknown"
+
+                result["cnn_app"] = cnn_app
+                result["cnn_confidence"] = cnn_conf
+                result["cnn_all_probs"] = {self.label_encoder.classes_[i]: float(p) for i, p in enumerate(cnn_proba)}
+
+                # XGBoost 90%, CNN 10% — CNN is unreliable until retrained
+                XGB_WEIGHT = 0.90
+                ensemble_proba = XGB_WEIGHT * xgb_proba + (1 - XGB_WEIGHT) * cnn_proba
+                ens_pred_idx = np.argmax(ensemble_proba)
+                ens_conf = float(ensemble_proba[ens_pred_idx])
+                result["ensemble_app"] = self.label_encoder.classes_[ens_pred_idx] if (ens_conf >= MIN_CONFIDENCE and not is_idle) else "Unknown"
+                result["ensemble_confidence"] = ens_conf
+
+            return result
+
+        except Exception as e:
+            return {"error": str(e)}
