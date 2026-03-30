@@ -298,7 +298,48 @@ with st.sidebar:
         st.markdown("### 🚀 ARP Spoofing (MITM)")
         st.caption("Scan your network and spoof all hosts — no need to specify IPs manually")
 
-        gateway_ip = st.text_input("Gateway IP", value="192.168.1.1")
+        # Gateway resolution: Auto or Manual
+        gw_mode = st.radio("Gateway IP", ["🔄 Auto Detect", "✏️ Manual"],
+                           horizontal=True, key="gw_mode")
+        if gw_mode == "🔄 Auto Detect":
+            @st.cache_data(ttl=30)
+            def _detect_gateway():
+                """Detect default gateway from system routing table."""
+                import subprocess, re, platform
+                try:
+                    if platform.system() == "Darwin":
+                        out = subprocess.check_output(
+                            ["netstat", "-rn"], text=True, timeout=5
+                        )
+                        for line in out.splitlines():
+                            parts = line.split()
+                            if len(parts) >= 3 and parts[0] == "default":
+                                gw = parts[1]
+                                # Validate it looks like an IPv4 address
+                                if re.match(r"^\d+\.\d+\.\d+\.\d+$", gw):
+                                    return gw
+                    else:  # Linux
+                        out = subprocess.check_output(
+                            ["ip", "route", "show", "default"], text=True, timeout=5
+                        )
+                        m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", out)
+                        if m:
+                            return m.group(1)
+                except Exception:
+                    pass
+                return None
+
+            detected_gw = _detect_gateway()
+            if detected_gw:
+                gateway_ip = detected_gw
+                st.success(f"🔄 Gateway: **{gateway_ip}**")
+            else:
+                st.warning("⚠️ Could not detect gateway — falling back to manual")
+                gateway_ip = st.text_input("Gateway IP (fallback)", value="192.168.1.1",
+                                           key="gw_fallback")
+        else:
+            gateway_ip = st.text_input("Gateway IP", value="192.168.1.1",
+                                        key="gw_manual")
 
         # Network scanner
         if st.button("🔍 Scan Network", use_container_width=True,
@@ -1084,11 +1125,12 @@ with tab5:
         st.dataframe(flow_df, use_container_width=True, height=400)
 
 # ── TAB 6: App Fingerprinting ──
+# ── TAB 6: App Fingerprinting ──
 with tab6:
     @st.fragment(run_every=_auto_refresh)
     def app_fingerprint():
         st.markdown("### 🧬 AI App Fingerprinting")
-        st.markdown("Identifies which app generated the captured traffic using packet metadata — without decrypting anything.")
+        st.markdown("Identifies which app generated the captured traffic using an ensemble of XGBoost and LightGBM — without decrypting anything.")
 
         _fp_packets = _get_packets()
         if not _fp_packets:
@@ -1182,16 +1224,11 @@ with tab6:
         from collections import Counter
 
         # ── Rolling majority vote ─────────────────────────────────────────────
-        # Like the collector: accumulate N windows, vote, then decide.
-        # At 0.5s step, VOTE_WINDOW=15 = 7.5 seconds of consensus per verdict
         VOTE_WINDOW = 15
         MIN_VOTE_SHARE = 0.55  # 55% of non-Unknown windows must agree
 
         def _rolling_vote(results, k):
-            """Simple count majority over the last k windows.
-            Using unweighted counts so a high-confidence YouTube window
-            doesn't outweigh multiple lower-confidence Meta windows.
-            """
+            """Simple count majority over the last k windows."""
             smoothed = []
             for i in range(len(results)):
                 bucket = results[max(0, i - k + 1): i + 1]
@@ -1200,7 +1237,7 @@ with tab6:
                     app = b["xgb_app"]
                     if app == "Unknown":
                         continue
-                    votes[app] = votes.get(app, 0) + 1  # one vote per window
+                    votes[app] = votes.get(app, 0) + 1
                 if votes:
                     winner = max(votes, key=votes.get)
                     score = votes[winner] / sum(votes.values())
@@ -1211,7 +1248,7 @@ with tab6:
 
         smoothed = _rolling_vote(window_results, VOTE_WINDOW)
         current = smoothed[-1]
-        # Suppress banner if vote share is too split (e.g. 50% YouTube + 50% Netflix = uncertain)
+        
         if current["score"] < MIN_VOTE_SHARE:
             current = {"app": "Uncertain", "score": current["score"], "n_votes": current["n_votes"]}
 
@@ -1227,7 +1264,7 @@ with tab6:
             f"border-radius:12px;padding:16px 24px;margin-bottom:16px'>"
             f"<span style='font-size:1.1em;color:#aaa'>Current App</span><br>"
             f"<span style='font-size:2.2em;font-weight:700;color:{verdict_color}'>"
-            f"{current['app'].upper()}</span>"
+            f"{current['app'].upper()}</span>"   
             f"<span style='font-size:1em;color:#aaa;margin-left:16px'>{label}</span>"
             f"</div>",
             unsafe_allow_html=True,
@@ -1260,9 +1297,9 @@ with tab6:
                 "Smoothed": smoothed[i]["app"],
                 "Vote Share": f"{smoothed[i]['score']:.0%}",
             }
-            if "cnn_app" in r:
-                row["CNN"] = r["cnn_app"]
-                row["CNN Conf"] = f"{r['cnn_confidence']:.1%}"
+            if "lgbm_app" in r:
+                row["LightGBM"] = r["lgbm_app"]
+                row["LGBM Conf"] = f"{r['lgbm_confidence']:.1%}"
             if "ensemble_app" in r:
                 row["Ensemble"] = r["ensemble_app"]
                 row["Ens Conf"] = f"{r['ensemble_confidence']:.1%}"
@@ -1275,20 +1312,23 @@ with tab6:
             "Time": [r["time"] for r in window_results],
             "XGBoost": [r["xgb_confidence"] for r in window_results],
         })
-        if "cnn_confidence" in window_results[0]:
-            chart_data["1D-CNN"] = [r["cnn_confidence"] for r in window_results]
+        if "lgbm_confidence" in window_results[0]:
+            chart_data["LightGBM"] = [r["lgbm_confidence"] for r in window_results]
         if "ensemble_confidence" in window_results[0]:
             chart_data["Ensemble"] = [r["ensemble_confidence"] for r in window_results]
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=chart_data["Time"], y=chart_data["XGBoost"],
             mode="lines+markers", name="XGBoost", line=dict(color="#2196F3", width=2)))
-        if "1D-CNN" in chart_data:
-            fig.add_trace(go.Scatter(x=chart_data["Time"], y=chart_data["1D-CNN"],
-                mode="lines+markers", name="1D-CNN", line=dict(color="#4CAF50", width=2)))
+        
+        if "LightGBM" in chart_data:
+            fig.add_trace(go.Scatter(x=chart_data["Time"], y=chart_data["LightGBM"],
+                mode="lines+markers", name="LightGBM", line=dict(color="#4CAF50", width=2)))
+                
         if "Ensemble" in chart_data:
             fig.add_trace(go.Scatter(x=chart_data["Time"], y=chart_data["Ensemble"],
                 mode="lines+markers", name="Ensemble", line=dict(color="#FF9800", width=2, dash="dot")))
+                
         fig.update_layout(height=400, yaxis_title="Confidence", xaxis_title="Time",
                           yaxis=dict(range=[0, 1.05]), template="plotly_white")
         st.plotly_chart(fig, use_container_width=True)
@@ -1298,12 +1338,13 @@ with tab6:
         selected_win = st.selectbox("Select a window", range(len(window_results)),
             format_func=lambda i: f"Window {i+1} @ {window_results[i]['time']} — "
                                   f"XGB: {window_results[i]['xgb_app']} ({window_results[i]['xgb_confidence']:.0%})"
-                                  + (f" | CNN: {window_results[i]['cnn_app']} ({window_results[i]['cnn_confidence']:.0%})"
-                                     if 'cnn_app' in window_results[i] else ""))
+                                  + (f" | LGBM: {window_results[i]['lgbm_app']} ({window_results[i]['lgbm_confidence']:.0%})"
+                                     if 'lgbm_app' in window_results[i] else ""))
 
         if selected_win is not None:
             wr = window_results[selected_win]
             dcol1, dcol2 = st.columns(2)
+            
             with dcol1:
                 st.markdown("#### 🚀 XGBoost Prediction")
                 st.markdown(f"**App: {wr['xgb_app'].upper()}** — {wr['xgb_confidence']:.1%} confidence")
@@ -1311,20 +1352,22 @@ with tab6:
                     for app, prob in sorted(wr["xgb_all_probs"].items(), key=lambda x: x[1], reverse=True):
                         bar = int(prob * 100)
                         st.markdown(f"`{app:20s}` {'█' * max(bar//3, 0)}{'░' * max(33 - bar//3, 0)} {prob:.1%}")
-            if "cnn_app" in wr:
+                        
+            if "lgbm_app" in wr:
                 with dcol2:
-                    st.markdown("#### 🧠 1D-CNN Prediction")
-                    st.markdown(f"**App: {wr['cnn_app'].upper()}** — {wr['cnn_confidence']:.1%} confidence")
-                    if "cnn_all_probs" in wr:
-                        for app, prob in sorted(wr["cnn_all_probs"].items(), key=lambda x: x[1], reverse=True):
+                    st.markdown("#### ⚡ LightGBM Prediction")
+                    st.markdown(f"**App: {wr['lgbm_app'].upper()}** — {wr['lgbm_confidence']:.1%} confidence")
+                    if "lgbm_all_probs" in wr:
+                        for app, prob in sorted(wr["lgbm_all_probs"].items(), key=lambda x: x[1], reverse=True):
                             bar = int(prob * 100)
                             st.markdown(f"`{app:20s}` {'█' * max(bar//3, 0)}{'░' * max(33 - bar//3, 0)} {prob:.1%}")
+                            
             if "ensemble_app" in wr:
                 st.markdown("---")
-                if wr["xgb_app"] == wr.get("cnn_app", ""):
+                if wr["xgb_app"] == wr.get("lgbm_app", ""):
                     st.success(f"✅ **Both models agree: {wr['ensemble_app'].upper()}** (Ensemble confidence: {wr['ensemble_confidence']:.1%})")
                 else:
-                    st.warning(f"⚠️ **Models disagree** — XGBoost: **{wr['xgb_app']}**, CNN: **{wr.get('cnn_app', '?')}**. Ensemble: **{wr['ensemble_app'].upper()}** ({wr['ensemble_confidence']:.1%})")
+                    st.warning(f"⚠️ **Models disagree** — XGBoost: **{wr['xgb_app']}**, LightGBM: **{wr.get('lgbm_app', '?')}**. Ensemble: **{wr['ensemble_app'].upper()}** ({wr['ensemble_confidence']:.1%})")
 
     app_fingerprint()
 # Auto-refresh is handled by @st.fragment(run_every=...) above.

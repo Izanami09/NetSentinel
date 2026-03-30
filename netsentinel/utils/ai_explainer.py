@@ -422,53 +422,39 @@ class ReportGenerator:
         pdf.output(output_path)
         return output_path
 
-# ─────────────────────────────────────────────
-# App Fingerprinting Engine
-# ─────────────────────────────────────────────
 class AppFingerprinter:
-    """Identifies apps from traffic patterns using trained XGBoost and 1D-CNN models."""
+    """Identifies apps from traffic patterns using an ensemble of trained XGBoost and LightGBM models."""
 
     def __init__(self):
         self.xgb_model = None
-        self.cnn_model = None
+        self.lgbm_model = None  # Replaced cnn_model with lgbm_model
         self.scaler = None
         self.label_encoder = None
         self.stat_features = None
-        self.pss_max = None
         self._load_models()
 
     def _load_models(self):
         try:
+            # Load XGBoost and feature dependencies
             xgb_path = os.path.join(MODEL_DIR, "app_xgboost.pkl")
             if os.path.exists(xgb_path):
                 self.xgb_model = joblib.load(xgb_path)
                 self.scaler = joblib.load(os.path.join(MODEL_DIR, "app_scaler.pkl"))
                 self.label_encoder = joblib.load(os.path.join(MODEL_DIR, "app_label_encoder.pkl"))
                 self.stat_features = joblib.load(os.path.join(MODEL_DIR, "app_stat_features.pkl"))
-                self.pss_max = joblib.load(os.path.join(MODEL_DIR, "app_pss_max.pkl"))
                 print("  ✅ App XGBoost model loaded")
 
-            cnn_path = os.path.join(MODEL_DIR, "app_cnn_model.keras")
-            if os.path.exists(cnn_path):
-                # Force CPU-only to avoid Metal/GPU segfault on Apple Silicon
-                os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-                os.environ["TF_METAL_DEVICE_ENABLE"] = "0"
-                import tensorflow as tf
-                tf.config.set_visible_devices([], "GPU")
-                self.cnn_model = tf.keras.models.load_model(cnn_path)
-                print("  ✅ App 1D-CNN model loaded (CPU mode)")
+            # Load LightGBM instead of CNN
+            lgbm_path = os.path.join(MODEL_DIR, "app_lightgbm.pkl")
+            if os.path.exists(lgbm_path):
+                self.lgbm_model = joblib.load(lgbm_path)
+                print("  ✅ App LightGBM model loaded")
+                
         except Exception as e:
             print(f"  ⚠️ App fingerprinting models not loaded: {e}")
 
     def predict(self, window_packets: list) -> dict:
-        """Predict which app generated this traffic window.
-        
-        Args:
-            window_packets: list of packet dicts from a time window
-            
-        Returns:
-            dict with predictions from both models
-        """
+        """Predict which app generated this traffic window."""
         if not self.xgb_model or len(window_packets) < 3:
             return None
 
@@ -478,7 +464,6 @@ class AppFingerprinter:
                          (1 if p.get("src_ip", "").startswith("192.168.") or 
                           p.get("src_ip", "").startswith("10.") else -1)
                          for p in window_packets]
-            signed_sizes = [s * d for s, d in zip(sizes, directions)]
             timestamps = [p.get("epoch", 0) for p in window_packets]
             payload_sizes = [p.get("payload_size", 0) for p in window_packets]
 
@@ -523,11 +508,9 @@ class AppFingerprinter:
             sb = [b/tp for b in sb]
 
             n_tcp  = sum(1 for p in window_packets if p.get("protocol") == "TCP")
-            # QUIC is already tagged in capture_engine; also catch UDP/443 as fallback
             n_quic = sum(1 for p in window_packets if p.get("protocol") == "QUIC" or
                         (p.get("protocol") == "UDP" and
                          (p.get("dst_port") == 443 or p.get("src_port") == 443)))
-            # Pure UDP = UDP that is not QUIC
             n_udp  = sum(1 for p in window_packets if p.get("protocol") == "UDP" and
                         p.get("dst_port") != 443 and p.get("src_port") != 443)
             n_total = max(len(window_packets), 1)
@@ -588,12 +571,12 @@ class AppFingerprinter:
                 "quic_ratio": n_quic / n_total,
             }
 
-            # Build feature vector for XGBoost
+            # Build feature vector 
             feat_vector = [raw_features.get(f, 0) for f in self.stat_features]
             X_stat = pd.DataFrame([feat_vector], columns=self.stat_features)
             X_stat_scaled = pd.DataFrame(self.scaler.transform(X_stat), columns=self.stat_features)
 
-            # XGBoost prediction
+            # ── 1. XGBoost Prediction ──
             xgb_proba = self.xgb_model.predict_proba(X_stat_scaled)[0]
             xgb_pred_idx = np.argmax(xgb_proba)
             xgb_app = self.label_encoder.classes_[xgb_pred_idx]
@@ -605,48 +588,34 @@ class AppFingerprinter:
                 "xgb_all_probs": {self.label_encoder.classes_[i]: float(p) for i, p in enumerate(xgb_proba)},
             }
 
-            # ── Idle/low-traffic gate ────────────────────────────────────
-            # Background OS traffic (updates, sync) looks like YouTube because
-            # it's also QUIC to Google IPs — gate on throughput to avoid false calls
+            # ── Idle/low-traffic gate ──
             bytes_per_sec = raw_features["bytes_per_sec"]
             is_idle = bytes_per_sec < 30_000  # < 30 KB/s = background noise
+            MIN_CONFIDENCE = 0.30  # Strict confidence threshold for boosting models
 
-            # ── Confidence gate ──────────────────────────────────────────
-            MIN_CONFIDENCE = 0.52  # raised from 0.40 — fewer wrong guesses
             if xgb_conf < MIN_CONFIDENCE or is_idle:
                 result["xgb_app"] = "Unknown"
 
-            # CNN prediction
-            if self.cnn_model and self.pss_max:
-                # Read PSS length from model input shape — matches training exactly
-                cnn_seq_len = self.cnn_model.input_shape[1]
-                pss = signed_sizes[:cnn_seq_len]
-                pss = pss + [0] * (cnn_seq_len - len(pss))
-                pss_norm = np.array(pss) / self.pss_max
-                X_cnn = pss_norm.reshape(1, cnn_seq_len, 1)
+            # ── 2. LightGBM Prediction ──
+            if self.lgbm_model:
+                lgbm_proba = self.lgbm_model.predict_proba(X_stat_scaled)[0]
+                lgbm_pred_idx = np.argmax(lgbm_proba)
+                lgbm_app = self.label_encoder.classes_[lgbm_pred_idx]
+                lgbm_conf = float(lgbm_proba[lgbm_pred_idx])
 
-                import tensorflow as tf
-                with tf.device("/CPU:0"):
-                    cnn_proba = self.cnn_model.predict(X_cnn, verbose=0)[0]
-                cnn_pred_idx = np.argmax(cnn_proba)
-                cnn_app = self.label_encoder.classes_[cnn_pred_idx]
-                cnn_conf = float(cnn_proba[cnn_pred_idx])
+                if lgbm_conf < MIN_CONFIDENCE or is_idle:
+                    lgbm_app = "Unknown"
 
-                # CNN trained poorly (val_acc ~17%) — heavily downweight it.
-                # Keep it visible in the table for debugging but don't let it
-                # pull the ensemble away from XGBoost's verdict.
-                if cnn_conf < MIN_CONFIDENCE or is_idle:
-                    cnn_app = "Unknown"
+                result["lgbm_app"] = lgbm_app
+                result["lgbm_confidence"] = lgbm_conf
+                result["lgbm_all_probs"] = {self.label_encoder.classes_[i]: float(p) for i, p in enumerate(lgbm_proba)}
 
-                result["cnn_app"] = cnn_app
-                result["cnn_confidence"] = cnn_conf
-                result["cnn_all_probs"] = {self.label_encoder.classes_[i]: float(p) for i, p in enumerate(cnn_proba)}
-
-                # XGBoost 90%, CNN 10% — CNN is unreliable until retrained
-                XGB_WEIGHT = 0.90
-                ensemble_proba = XGB_WEIGHT * xgb_proba + (1 - XGB_WEIGHT) * cnn_proba
+                # ── 3. The Ensemble (50/50 Split) ──
+                # Since both models hit ~0.88 F1, we give them equal weight
+                ensemble_proba = (xgb_proba + lgbm_proba) / 2
                 ens_pred_idx = np.argmax(ensemble_proba)
                 ens_conf = float(ensemble_proba[ens_pred_idx])
+                
                 result["ensemble_app"] = self.label_encoder.classes_[ens_pred_idx] if (ens_conf >= MIN_CONFIDENCE and not is_idle) else "Unknown"
                 result["ensemble_confidence"] = ens_conf
 
